@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+title: "ConvaSimu"
+message: "If you use this software, please cite the associated manuscript and this repository."
+type: software
+authors:
+  - family-names: Sashurpour
+    given-names: Milad
+  - family-names: Alecsandru
+    given-names: Ciprian
+repository-code: "https://github.com/TransLabConcordia/ConvaSimu"
+version: "1.0.0"
+date-released: "2026-07-01"
