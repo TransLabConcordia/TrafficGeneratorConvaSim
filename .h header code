@@ -1,0 +1,152 @@
+// SimpleDataExtractionActor.h
+
+#pragma once
+
+#include "CoreMinimal.h"
+#include "GameFramework/Actor.h"
+#include "OpenDriveAsset.h"
+#include "Components/SplineComponent.h"
+#include "SimpleDataExtractionActor.generated.h"
+
+/**
+ * Simple representation of a road marking used for drawing/styling.
+ */
+USTRUCT()
+struct FRoadMarkInfo
+{
+    GENERATED_BODY()
+
+        // type attribute (e.g., "broken", "none", etc.)
+        FString Type;
+
+    // color attribute (e.g., "white", "yellow")
+    FString Color;
+
+    // laneChange attribute
+    FString LaneChange;
+
+    // width (optional)
+    float Width = 0.f;
+
+    // sOffset
+    float SOffset = 0.f;
+};
+
+/**
+ * Represents one lane boundary (outer edge) to draw in 2D.
+ */
+USTRUCT()
+struct FDrivingLaneInfo
+{
+    GENERATED_BODY()
+
+        // Road identifier (name or id)
+        FString RoadKey;
+
+    // Lane type (e.g., driving, shoulder, sidewalk, none)
+    FString LaneType;
+
+    // Lane id (e.g., "1" or "-1")
+    FString LaneId;
+
+    // Left side of reference line?
+    bool bIsLeft = false;
+
+    // +1 forward, -1 backward, 0 unknown
+    int32 TravelDir = 0;
+
+    // Outer boundary sampled points (2D)
+    TArray<FVector2D> Points;
+
+    // Connectivity (lane-level preferred, falls back to road-level)
+    FString Predecessor;
+    FString Successor;
+
+    // Optional road marking for the lane (aggregated)
+    TArray<FRoadMarkInfo> RoadMarks;
+
+    // Starting s of the laneSection fragment this came from
+    float SectionStartS = 0.f;
+};
+
+class UMaterialInterface;
+
+UCLASS()
+class OPENDRIVE_API ASimpleDataExtractionActor : public AActor
+{
+    GENERATED_BODY()
+
+public:
+    ASimpleDataExtractionActor();
+
+protected:
+    // Called when placed or moved in the Editor, or when a property changes
+    virtual void OnConstruction(const FTransform& Transform) override;
+
+    // Called at runtime; here, left empty since generation is done in OnConstruction
+    virtual void BeginPlay() override;
+
+private:
+    // ────────────────────────────────────────────────────────────
+    //  Re-generation guard (Step-1 optimisation)
+    // ────────────────────────────────────────────────────────────
+    /** Cached CRC32 of the OpenDRIVE text that was last visualised */
+    uint32 CachedContentHash = 0;
+
+    /** True once we have successfully generated splines at least once */
+    bool   bGeneratedOnce = false;
+
+    // Primary extraction entrypoint
+    bool ExtractDrivingLanesFromXodr(TArray<FDrivingLaneInfo>& OutLanes);
+
+    // String-search helpers
+    bool ExtractAttribute(const FString& Source, const FString& AttrName, int32 StartPos, FString& OutValue) const;
+    float ParseFloat(const FString& In) const;
+    int32 ParseTravelDir(const FString& LaneChunk) const;
+
+    // Geometry sampling
+    struct FSample
+    {
+        float s = 0.f;
+        FVector2D point = FVector2D::ZeroVector;
+        float heading = 0.f;
+    };
+    void BuildReferenceLineSamples(const FString& RoadChunk, TArray<FSample>& OutSamples) const;
+
+    // legacy helpers
+    float EvaluateLaneOffset(const FString& LaneOffsetHeader, float QueryS) const;
+    float EvaluateWidth(const FString& WidthHeader, float DeltaS) const;
+
+    // Created spline components for visualization / future mesh attachment
+    UPROPERTY()
+        TArray<USplineComponent*> LaneSplines;
+
+public:
+    // ────────────────────────────────────────────────────────────
+    //  Materials per lane type (editable in editor)
+    // ────────────────────────────────────────────────────────────
+
+    /** Fallback material if a specific lane-type material is not set */
+    UPROPERTY(EditAnywhere, Category = "Lane Materials")
+        UMaterialInterface* DefaultLaneMaterial = nullptr;
+
+    /** Material for 'driving' lanes */
+    UPROPERTY(EditAnywhere, Category = "Lane Materials")
+        UMaterialInterface* DrivingMaterial = nullptr;
+
+    /** Material for 'shoulder' lanes */
+    UPROPERTY(EditAnywhere, Category = "Lane Materials")
+        UMaterialInterface* ShoulderMaterial = nullptr;
+
+    /** Material for 'sidewalk' lanes */
+    UPROPERTY(EditAnywhere, Category = "Lane Materials")
+        UMaterialInterface* SidewalkMaterial = nullptr;
+
+    /** Material for 'none' lane entries (usually center/neutral) */
+    UPROPERTY(EditAnywhere, Category = "Lane Materials")
+        UMaterialInterface* NoneMaterial = nullptr;
+
+    /** Material used for successor connector segments between lanes */
+    UPROPERTY(EditAnywhere, Category = "Lane Materials")
+        UMaterialInterface* ConnectorMaterial = nullptr;
+};
