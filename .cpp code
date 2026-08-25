@@ -1,0 +1,1043 @@
+// SimpleDataExtractionActor.cpp
+
+#include "SimpleDataExtractionActor.h"
+#include "Engine/Engine.h"
+#include "UObject/UObjectIterator.h"
+#include "Algo/Reverse.h"
+#include "Components/SplineComponent.h"
+#include "Components/SplineMeshComponent.h"
+#include "Engine/StaticMesh.h"
+#include "UObject/ConstructorHelpers.h"
+#include "Materials/MaterialInterface.h"
+
+#define UNIFIED_HEIGHT 50.0f
+#define CONNECTOR_DUPLICATE_THRESHOLD 1e-2f
+
+// --- tiny Z nudges per lane type to avoid z-fighting (visual only) ---
+static float LaneTypeZOffset(const FString& LaneType)
+{
+    if (LaneType.Equals(TEXT("driving"), ESearchCase::IgnoreCase))  return 0.00f;
+    if (LaneType.Equals(TEXT("shoulder"), ESearchCase::IgnoreCase)) return 0.02f;
+    if (LaneType.Equals(TEXT("sidewalk"), ESearchCase::IgnoreCase)) return 0.04f;
+    if (LaneType.Equals(TEXT("none"), ESearchCase::IgnoreCase))     return 0.06f;
+    return 0.00f;
+}
+
+// --- NEW: per-lane width samples captured during parsing, keyed to match spline points ---
+// Key format: RoadKey|LaneType|LaneId|L/R
+static FString MakeLaneKey(const FString& RoadKey, const FString& LaneType, const FString& LaneId, bool bIsLeft)
+{
+    return RoadKey + TEXT("|") + LaneType + TEXT("|") + LaneId + TEXT("|") + (bIsLeft ? TEXT("L") : TEXT("R"));
+}
+static TMap<FString, TArray<float>> GLaneWidthSamples; // width at each point in Info.Points (same indexing)
+
+ASimpleDataExtractionActor::ASimpleDataExtractionActor()
+{
+    PrimaryActorTick.bCanEverTick = false;
+
+    // Ensure we have a root component to attach splines to.
+    if (!RootComponent)
+    {
+        RootComponent = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
+    }
+}
+
+// Called when placed or moved in the editor, or when a property changes
+void ASimpleDataExtractionActor::OnConstruction(const FTransform& Transform)
+{
+    Super::OnConstruction(Transform);
+
+    // ────────────────────────────────────────────────────────────
+    //  STEP-1  ▶  Skip heavy rebuild when the OpenDRIVE text is unchanged
+    //            but ALWAYS reapply materials to existing components.
+    // ────────────────────────────────────────────────────────────
+    UOpenDriveAsset* XodrAsset = nullptr;
+    for (TObjectIterator<UOpenDriveAsset> It; It; ++It)
+    {
+        XodrAsset = *It;
+        break;
+    }
+    if (!XodrAsset || XodrAsset->XodrContent.IsEmpty())
+        return;
+
+    const uint32 NewHash = FCrc::StrCrc32(*XodrAsset->XodrContent);
+
+    // Helper: reapply materials to existing spline meshes using tags
+    auto ReapplyMaterialsToExisting = [&]()
+    {
+        TArray<UActorComponent*> Comps = GetComponentsByClass(USplineMeshComponent::StaticClass());
+        for (UActorComponent* C : Comps)
+        {
+            USplineMeshComponent* SM = Cast<USplineMeshComponent>(C);
+            if (!SM) continue;
+
+            // Find "LaneType=..." tag
+            FString LaneTypeStr;
+            for (const FName& Tag : SM->ComponentTags)
+            {
+                const FString T = Tag.ToString();
+                if (T.StartsWith(TEXT("LaneType=")))
+                {
+                    LaneTypeStr = T.Mid(9);
+                    break;
+                }
+            }
+            if (LaneTypeStr.IsEmpty())
+                continue;
+
+            FString LT = LaneTypeStr;
+            LT.TrimStartAndEndInline();
+            LT.ToLowerInline();
+
+            UMaterialInterface* Mat = nullptr;
+            if (LT == TEXT("connector"))
+            {
+                Mat = ConnectorMaterial;
+            }
+            else if (LT == TEXT("driving"))
+            {
+                Mat = DrivingMaterial;
+            }
+            else if (LT == TEXT("shoulder"))
+            {
+                Mat = ShoulderMaterial;
+            }
+            else if (LT == TEXT("sidewalk"))
+            {
+                Mat = SidewalkMaterial;
+            }
+            else if (LT == TEXT("none"))
+            {
+                Mat = NoneMaterial;
+            }
+
+            if (Mat)
+            {
+                SM->SetMaterial(0, Mat);
+            }
+        }
+    };
+
+    if (bGeneratedOnce && NewHash == CachedContentHash)
+    {
+        // Content unchanged → just refresh materials on existing components.
+        ReapplyMaterialsToExisting();
+        return;
+    }
+
+    CachedContentHash = NewHash;
+    bGeneratedOnce = true;
+
+    // ────────────────────────────────────────────────────────────
+    //  Tear down previous spline components
+    // ────────────────────────────────────────────────────────────
+    for (USplineComponent* Spline : LaneSplines)
+        if (Spline) Spline->DestroyComponent();
+    LaneSplines.Empty();
+
+    // Extract and build lanes once in the editor
+    TArray<FDrivingLaneInfo> DrivingLanes;
+    if (!ExtractDrivingLanesFromXodr(DrivingLanes))
+    {
+        UE_LOG(LogTemp, Error, TEXT("❌ Failed to extract any lane infos in Editor."));
+        return;
+    }
+
+    UE_LOG(LogTemp, Warning, TEXT("✅ Editor-generated %d lane infos."), DrivingLanes.Num());
+
+    UStaticMesh* LineMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+    if (!LineMesh)
+        UE_LOG(LogTemp, Error, TEXT("Failed to load BasicShapes/Cube."));
+
+    // Helper to choose a material strictly by lane type (no default fallback).
+    auto ChooseMaterialForLaneType = [&](const FString& LaneTypeRaw) -> UMaterialInterface*
+    {
+        FString LT = LaneTypeRaw;
+        LT.TrimStartAndEndInline();
+        LT.ToLowerInline();
+
+        if (LT == TEXT("driving"))  return DrivingMaterial;
+        if (LT == TEXT("shoulder")) return ShoulderMaterial;
+        if (LT == TEXT("sidewalk")) return SidewalkMaterial;
+        if (LT == TEXT("none"))     return NoneMaterial;
+        return nullptr;
+    };
+
+    // ── 1) One spline + many spline-meshes per lane ─────────────────────
+    for (const auto& Info : DrivingLanes)
+    {
+        if (Info.Points.Num() < 2) continue;
+
+        FString SplineName = FString::Printf(
+            TEXT("LaneSpline_%s_%s_%s_%s"),
+            *Info.RoadKey, *Info.LaneType, *Info.LaneId,
+            Info.bIsLeft ? TEXT("L") : TEXT("R"));
+
+        USplineComponent* SplineComp = NewObject<USplineComponent>(this, *SplineName);
+        if (!SplineComp) continue;
+
+        SplineComp->RegisterComponent();
+        SplineComp->SetMobility(EComponentMobility::Static);
+        SplineComp->AttachToComponent(RootComponent, FAttachmentTransformRules::KeepRelativeTransform);
+        SplineComp->ClearSplinePoints(false);
+
+        const float Z = UNIFIED_HEIGHT + LaneTypeZOffset(Info.LaneType);
+
+        for (int32 i = 0; i < Info.Points.Num(); ++i)
+        {
+            const FVector2D& P2D = Info.Points[i];
+            // SCALE: OpenDRIVE meters → Unreal centimeters
+            SplineComp->AddPoint(FSplinePoint(i, FVector(P2D.X * 100.0f, P2D.Y * 100.0f, Z),
+                ESplinePointType::Curve), false);
+        }
+        SplineComp->UpdateSpline();
+
+        if (LineMesh)
+        {
+            UMaterialInterface* LaneMat = ChooseMaterialForLaneType(Info.LaneType);
+
+            // NEW: lookup per-point widths captured during parsing
+            const FString LaneKey = MakeLaneKey(Info.RoadKey, Info.LaneType, Info.LaneId, Info.bIsLeft);
+            const TArray<float>* WidthSeriesPtr = GLaneWidthSamples.Find(LaneKey);
+
+            // NEW: account for reversed travel direction (local +Y flips when tangent flips).
+            const float DirSign = (Info.TravelDir == -1) ? -1.0f : 1.0f;
+            const float TowardCenterSign = (Info.bIsLeft ? -1.0f : +1.0f) * DirSign;
+
+            for (int32 i = 0; i < SplineComp->GetNumberOfSplinePoints() - 1; ++i)
+            {
+                FVector P0, T0, P1, T1;
+                SplineComp->GetLocationAndTangentAtSplinePoint(i, P0, T0, ESplineCoordinateSpace::World);
+                SplineComp->GetLocationAndTangentAtSplinePoint(i + 1, P1, T1, ESplineCoordinateSpace::World);
+
+                // Pull width at segment endpoints (fallback to last known width or a tiny value)
+                float w0 = 5.0f, w1 = 5.0f; // meters (fallback)
+                if (WidthSeriesPtr && WidthSeriesPtr->Num() > 0)
+                {
+                    const int32 Nw = WidthSeriesPtr->Num();
+                    const float w0tmp = (i < Nw) ? (*WidthSeriesPtr)[i] : (*WidthSeriesPtr)[Nw - 1];
+                    const float w1tmp = (i + 1 < Nw) ? (*WidthSeriesPtr)[i + 1] : (*WidthSeriesPtr)[Nw - 1];
+                    w0 = FMath::Max(0.001f, w0tmp);
+                    w1 = FMath::Max(0.001f, w1tmp);
+                }
+
+                // SCALE: convert meters → centimeters for mesh sizing/offset
+                w0 *= 100.0f;
+                w1 *= 100.0f;
+
+                // Convert to SplineMesh scale for the engine cube (100uu in Y/Z)
+                // Per your request: width AND thickness equal lane width.
+                const float yScale0 = w0 / 100.0f;
+                const float yScale1 = w1 / 100.0f;
+                const float zScale0 = yScale0;
+                const float zScale1 = yScale1;
+
+                // Offset the mesh so the OUTER edge sits on the boundary spline
+                // and the mesh extends TOWARD the centerline.
+                // IMPORTANT: SetStart/EndOffset expect (Y, Z). Lateral is the **first** component.
+                const FVector2D startOffset(TowardCenterSign * (w0 * 0.5f), 0.0f);
+                const FVector2D endOffset(TowardCenterSign * (w1 * 0.5f), 0.0f);
+
+                FString MeshName = FString::Printf(
+                    TEXT("LaneMesh_%s_%s_%s_Seg_%d"),
+                    *Info.RoadKey, *Info.LaneType, *Info.LaneId, i);
+
+                USplineMeshComponent* SplineMesh = NewObject<USplineMeshComponent>(this, *MeshName);
+                if (!SplineMesh) continue;
+
+                SplineMesh->SetStaticMesh(LineMesh);
+                SplineMesh->RegisterComponent();
+                SplineMesh->SetMobility(EComponentMobility::Static);
+                SplineMesh->AttachToComponent(SplineComp, FAttachmentTransformRules::KeepRelativeTransform);
+                SplineMesh->SetStartAndEnd(P0, T0, P1, T1, true);
+
+                // Apply scale (Y=width, Z=thickness=width) and edge-alignment offset
+                SplineMesh->SetStartScale(FVector2D(yScale0, zScale0));
+                SplineMesh->SetEndScale(FVector2D(yScale1, zScale1));
+                SplineMesh->SetStartOffset(startOffset);
+                SplineMesh->SetEndOffset(endOffset);
+
+                // Tag this component with its lane type so we can reapply materials later without rebuilding.
+                {
+                    FString LT = Info.LaneType;
+                    LT.TrimStartAndEndInline();
+                    LT.ToLowerInline();
+                    SplineMesh->ComponentTags.Add(FName(*FString::Printf(TEXT("LaneType=%s"), *LT)));
+                }
+
+                if (LaneMat)
+                {
+                    SplineMesh->SetMaterial(0, LaneMat);
+                }
+            }
+        }
+        LaneSplines.Add(SplineComp);
+    }
+
+    // ── 2) CONNECTORS – O(N) using a lookup map ──────────────────────────
+    {
+        TMap<FString, const FDrivingLaneInfo*> LaneLookup;
+        for (const FDrivingLaneInfo& L : DrivingLanes)
+            LaneLookup.Add(L.LaneId, &L);
+
+        for (const FDrivingLaneInfo& Info : DrivingLanes)
+        {
+            if (Info.Successor.IsEmpty())
+                continue;
+
+            const FDrivingLaneInfo* Next = LaneLookup.FindRef(Info.Successor);
+            if (!Next || Next->RoadKey != Info.RoadKey)
+                continue;
+            if (Info.Points.Num() == 0 || Next->Points.Num() == 0)
+                continue;
+
+            // SCALE: points were stored in meters → convert to centimeters here
+            FVector EndThis(Info.Points.Last().X * 100.0f, Info.Points.Last().Y * 100.0f, UNIFIED_HEIGHT);
+            FVector StartNext(Next->Points[0].X * 100.0f, Next->Points[0].Y * 100.0f, UNIFIED_HEIGHT);
+            if (FVector::Dist(EndThis, StartNext) < CONNECTOR_DUPLICATE_THRESHOLD)
+                continue;
+
+            FString ConnName = FString::Printf(
+                TEXT("SuccConnector_%s_%s_%s_to_%s"),
+                *Info.RoadKey, *Info.LaneType, *Info.LaneId, *Next->LaneId);
+
+            USplineComponent* ConnSpline = NewObject<USplineComponent>(this, *ConnName);
+            ConnSpline->RegisterComponent();
+            ConnSpline->SetMobility(EComponentMobility::Static);
+            ConnSpline->AttachToComponent(RootComponent, FAttachmentTransformRules::KeepRelativeTransform);
+            ConnSpline->ClearSplinePoints(false);
+            ConnSpline->AddPoint(FSplinePoint(0, EndThis, ESplinePointType::Linear), false);
+            ConnSpline->AddPoint(FSplinePoint(1, StartNext, ESplinePointType::Linear), false);
+            ConnSpline->UpdateSpline();
+
+            if (LineMesh && ConnSpline->GetNumberOfSplinePoints() >= 2)
+            {
+                FVector P0, T0, P1, T1;
+                ConnSpline->GetLocationAndTangentAtSplinePoint(0, P0, T0, ESplineCoordinateSpace::World);
+                ConnSpline->GetLocationAndTangentAtSplinePoint(1, P1, T1, ESplineCoordinateSpace::World);
+
+                FString MeshName = FString::Printf(
+                    TEXT("ConnectorMesh_%s_%s_%s_to_%s"),
+                    *Info.RoadKey, *Info.LaneType, *Info.LaneId, *Next->LaneId);
+
+                USplineMeshComponent* ConnMesh = NewObject<USplineMeshComponent>(this, *MeshName);
+                if (ConnMesh)
+                {
+                    ConnMesh->SetStaticMesh(LineMesh);
+                    ConnMesh->RegisterComponent();
+                    ConnMesh->SetMobility(EComponentMobility::Static);
+                    ConnMesh->AttachToComponent(ConnSpline, FAttachmentTransformRules::KeepRelativeTransform);
+                    ConnMesh->SetStartAndEnd(P0, T0, P1, T1, true);
+                    ConnMesh->SetStartScale(FVector2D(0.05f));
+                    ConnMesh->SetEndScale(FVector2D(0.05f));
+
+                    // Tag as connector so we can reapply materials later without a rebuild.
+                    ConnMesh->ComponentTags.Add(FName(TEXT("LaneType=connector")));
+
+                    // Prefer ConnectorMaterial; if not set, optionally fall back to source lane type (no global default).
+                    UMaterialInterface* Mat = ConnectorMaterial ? ConnectorMaterial : ChooseMaterialForLaneType(Info.LaneType);
+                    if (Mat) ConnMesh->SetMaterial(0, Mat);
+                }
+            }
+            LaneSplines.Add(ConnSpline);
+        }
+    }
+
+#if WITH_EDITOR
+    {
+        const int32 Count = GetComponentsByClass(USplineMeshComponent::StaticClass()).Num();
+        UE_LOG(LogTemp, Warning, TEXT("🔍 SplineMeshComponents: %d"), Count);
+    }
+#endif
+}
+
+
+void ASimpleDataExtractionActor::BeginPlay()
+{
+    Super::BeginPlay();
+    // Generation already done in the editor via OnConstruction()
+}
+
+
+struct FLaneOffsetPiece
+{
+    float s = 0;
+    float a = 0;
+    float b = 0;
+    float c = 0;
+    float d = 0;
+};
+
+// helper: evaluate piecewise laneOffset (last piece with s <= queryS)
+static float EvaluateLaneOffsetPieces(const TArray<FLaneOffsetPiece>& Pieces, float QueryS)
+{
+    if (Pieces.Num() == 0)
+        return 0.f;
+
+    const FLaneOffsetPiece* Chosen = nullptr;
+    for (const FLaneOffsetPiece& P : Pieces)
+    {
+        if (P.s <= QueryS)
+            Chosen = &P;
+        else
+            break;
+    }
+    if (!Chosen)
+        Chosen = &Pieces[0];
+
+    float ds = QueryS - Chosen->s;
+    return Chosen->a + Chosen->b * ds + Chosen->c * ds * ds + Chosen->d * ds * ds * ds;
+}
+
+// helper to compute heading between last two points (returns 0 if insufficient)
+static float HeadingFromLastSegment(const TArray<FVector2D>& Points)
+{
+    if (Points.Num() < 2)
+        return 0.f;
+    const FVector2D& A = Points[Points.Num() - 2];
+    const FVector2D& B = Points.Last();
+    FVector2D Delta = B - A;
+    return FMath::Atan2(Delta.Y, Delta.X);
+}
+
+// returns smallest angular difference in radians
+static float AngularDifference(float A, float B)
+{
+    float Diff = FMath::Fmod(B - A + PI, 2 * PI) - PI;
+    return FMath::Abs(Diff);
+}
+
+bool ASimpleDataExtractionActor::ExtractDrivingLanesFromXodr(TArray<FDrivingLaneInfo>& OutLanes)
+{
+    // NEW: reset per-run width capture
+    GLaneWidthSamples.Reset();
+
+    bool bFoundAny = false;
+    for (TObjectIterator<UOpenDriveAsset> It; It; ++It)
+    {
+        UOpenDriveAsset* Asset = *It;
+        if (!Asset || Asset->XodrContent.IsEmpty())
+            continue;
+
+        const FString& Content = Asset->XodrContent;
+
+        int32 RoadPos = 0;
+        while (true)
+        {
+            int32 RoadStart = Content.Find(TEXT("<road"), ESearchCase::IgnoreCase, ESearchDir::FromStart, RoadPos);
+            if (RoadStart == INDEX_NONE)
+                break;
+            int32 RoadEnd = Content.Find(TEXT("</road>"), ESearchCase::IgnoreCase, ESearchDir::FromStart, RoadStart);
+            if (RoadEnd == INDEX_NONE)
+                break;
+            RoadEnd += FString(TEXT("</road>")).Len();
+            FString RoadChunk = Content.Mid(RoadStart, RoadEnd - RoadStart);
+            RoadPos = RoadEnd;
+
+            // identify road key (name or id)
+            FString RoadKey;
+            if (!ExtractAttribute(RoadChunk, TEXT("name"), 0, RoadKey) || RoadKey.IsEmpty())
+                ExtractAttribute(RoadChunk, TEXT("id"), 0, RoadKey);
+
+            // connectivity: road-level link
+            FString Predecessor, Successor;
+            int32 LinkPos = RoadChunk.Find(TEXT("<link"), ESearchCase::IgnoreCase, ESearchDir::FromStart, 0);
+            if (LinkPos != INDEX_NONE)
+            {
+                int32 PredPos = RoadChunk.Find(TEXT("<predecessor"), ESearchCase::IgnoreCase, ESearchDir::FromStart, LinkPos);
+                if (PredPos != INDEX_NONE)
+                {
+                    ExtractAttribute(RoadChunk, TEXT("elementId"), PredPos, Predecessor);
+                }
+                int32 SuccPos = RoadChunk.Find(TEXT("<successor"), ESearchCase::IgnoreCase, ESearchDir::FromStart, LinkPos);
+                if (SuccPos != INDEX_NONE)
+                {
+                    ExtractAttribute(RoadChunk, TEXT("elementId"), SuccPos, Successor);
+                }
+            }
+
+            // build reference line samples
+            TArray<FSample> Samples;
+            BuildReferenceLineSamples(RoadChunk, Samples);
+            if (Samples.Num() == 0)
+                continue;
+
+            // parse all laneOffset pieces
+            TArray<FLaneOffsetPiece> LaneOffsetPieces;
+            int32 LOpos = 0;
+            while (true)
+            {
+                int32 LOStart = RoadChunk.Find(TEXT("<laneOffset"), ESearchCase::IgnoreCase, ESearchDir::FromStart, LOpos);
+                if (LOStart == INDEX_NONE)
+                    break;
+                int32 LOEnd = RoadChunk.Find(TEXT(">"), ESearchCase::IgnoreCase, ESearchDir::FromStart, LOStart);
+                if (LOEnd == INDEX_NONE)
+                    break;
+                FString Header = RoadChunk.Mid(LOStart, LOEnd - LOStart + 1);
+                FLaneOffsetPiece Piece;
+                FString tmp;
+                if (ExtractAttribute(Header, TEXT("s"), 0, tmp)) Piece.s = ParseFloat(tmp);
+                if (ExtractAttribute(Header, TEXT("a"), 0, tmp)) Piece.a = ParseFloat(tmp);
+                if (ExtractAttribute(Header, TEXT("b"), 0, tmp)) Piece.b = ParseFloat(tmp);
+                if (ExtractAttribute(Header, TEXT("c"), 0, tmp)) Piece.c = ParseFloat(tmp);
+                if (ExtractAttribute(Header, TEXT("d"), 0, tmp)) Piece.d = ParseFloat(tmp);
+                LaneOffsetPieces.Add(Piece);
+                LOpos = LOEnd + 1;
+            }
+            LaneOffsetPieces.Sort([](const FLaneOffsetPiece& A, const FLaneOffsetPiece& B) { return A.s < B.s; });
+
+            // laneSections  (FIX: search inside RoadChunk, not Content)
+            int32 SectionPos = 0;
+            TArray<FDrivingLaneInfo> TempLanes; // final per-lane outputs for this road (fragments; merged later)
+
+            while (true)
+            {
+                int32 SectionStart = RoadChunk.Find(TEXT("<laneSection"), ESearchCase::IgnoreCase, ESearchDir::FromStart, SectionPos);
+                if (SectionStart == INDEX_NONE)
+                    break;
+                int32 SectionEnd = RoadChunk.Find(TEXT("</laneSection>"), ESearchCase::IgnoreCase, ESearchDir::FromStart, SectionStart);
+                if (SectionEnd == INDEX_NONE)
+                    break;
+                FString SectionChunk = RoadChunk.Mid(SectionStart, SectionEnd + FString(TEXT("</laneSection>")).Len() - SectionStart);
+                SectionPos = SectionEnd + 1;
+
+                // section station s
+                FString SectionSStr;
+                float SectionS = 0.f;
+                if (ExtractAttribute(SectionChunk, TEXT("s"), 0, SectionSStr))
+                    SectionS = ParseFloat(SectionSStr);
+
+                // --- Collect lanes per side in this section, then build cumulative outer boundaries ---
+                struct FRawLane
+                {
+                    FString LaneType;
+                    FString LaneId;
+                    bool    bIsLeft = false;
+                    int32   TravelDir = 0;
+
+                    // width poly (first width only, consistent with previous code)
+                    float WidthSOffset = 0.f;
+                    float A = 0.f, B = 0.f, C = 0.f, D = 0.f;
+
+                    // links (prefer lane-level; else inherit road-level)
+                    FString Predecessor;
+                    FString Successor;
+
+                    // road marks (aggregated)
+                    TArray<FRoadMarkInfo> RoadMarks;
+                };
+
+                auto ParseSideIntoRaw = [&](const FString& SideTag, bool bIsLeft, TArray<FRawLane>& OutRawLanes)
+                {
+                    FString OpenTag = FString::Printf(TEXT("<%s>"), *SideTag);
+                    FString CloseTag = FString::Printf(TEXT("</%s>"), *SideTag);
+                    int32 SideStart = SectionChunk.Find(*OpenTag, ESearchCase::IgnoreCase, ESearchDir::FromStart, 0);
+                    if (SideStart == INDEX_NONE)
+                        return;
+                    int32 SideEnd = SectionChunk.Find(*CloseTag, ESearchCase::IgnoreCase, ESearchDir::FromStart, SideStart);
+                    if (SideEnd == INDEX_NONE)
+                        return;
+                    FString SideChunk = SectionChunk.Mid(SideStart, SideEnd + CloseTag.Len() - SideStart);
+
+                    int32 LanePos = 0;
+                    while (true)
+                    {
+                        int32 LaneStart = SideChunk.Find(TEXT("<lane"), ESearchCase::IgnoreCase, ESearchDir::FromStart, LanePos);
+                        if (LaneStart == INDEX_NONE)
+                            break;
+                        int32 LaneTagEnd = SideChunk.Find(TEXT(">"), ESearchCase::IgnoreCase, ESearchDir::FromStart, LaneStart);
+                        if (LaneTagEnd == INDEX_NONE)
+                            break;
+                        int32 LaneClose = SideChunk.Find(TEXT("</lane>"), ESearchCase::IgnoreCase, ESearchDir::FromStart, LaneTagEnd);
+                        if (LaneClose == INDEX_NONE)
+                            break;
+
+                        FString LaneChunk = SideChunk.Mid(LaneStart, LaneClose + FString(TEXT("</lane>")).Len() - LaneStart);
+                        LanePos = LaneClose + 1;
+
+                        // Read lane attributes strictly from the opening <lane ...> tag
+                        FString LaneHeader = SideChunk.Mid(LaneStart, LaneTagEnd - LaneStart + 1);
+
+                        // only these lane types
+                        FString LaneType;
+                        if (!ExtractAttribute(LaneHeader, TEXT("type"), 0, LaneType))
+                            continue;
+                        if (!LaneType.Equals(TEXT("driving"), ESearchCase::IgnoreCase)
+                            && !LaneType.Equals(TEXT("shoulder"), ESearchCase::IgnoreCase)
+                            && !LaneType.Equals(TEXT("sidewalk"), ESearchCase::IgnoreCase)
+                            && !LaneType.Equals(TEXT("none"), ESearchCase::IgnoreCase))
+                            continue;
+
+                        // lane id
+                        FString LaneId;
+                        ExtractAttribute(LaneHeader, TEXT("id"), 0, LaneId);
+
+                        // travel direction from <vectorLane>
+                        int32 TravelDir = 0;
+                        int32 VectorLanePos = LaneChunk.Find(TEXT("<vectorLane"), ESearchCase::IgnoreCase);
+                        if (VectorLanePos != INDEX_NONE)
+                        {
+                            int32 VLend = LaneChunk.Find(TEXT(">"), ESearchCase::IgnoreCase, ESearchDir::FromStart, VectorLanePos);
+                            if (VLend != INDEX_NONE)
+                            {
+                                FString VectorLaneHeader = LaneChunk.Mid(VectorLanePos, VLend - VectorLanePos + 1);
+                                FString TDirStr;
+                                if (ExtractAttribute(VectorLaneHeader, TEXT("travelDir"), 0, TDirStr))
+                                {
+                                    if (TDirStr.Equals(TEXT("forward"), ESearchCase::IgnoreCase))
+                                        TravelDir = +1;
+                                    else if (TDirStr.Equals(TEXT("backward"), ESearchCase::IgnoreCase))
+                                        TravelDir = -1;
+                                }
+                            }
+                        }
+                        if (TravelDir == 0)
+                        {
+                            TravelDir = ParseTravelDir(LaneChunk);
+                        }
+
+                        // lane-level link predecessor/successor
+                        FString LanePred, LaneSucc;
+                        int32 LaneLinkPos = LaneChunk.Find(TEXT("<link"), ESearchCase::IgnoreCase);
+                        if (LaneLinkPos != INDEX_NONE)
+                        {
+                            int32 PredPos = LaneChunk.Find(TEXT("<predecessor"), ESearchCase::IgnoreCase, ESearchDir::FromStart, LaneLinkPos);
+                            if (PredPos != INDEX_NONE)
+                            {
+                                ExtractAttribute(LaneChunk, TEXT("id"), PredPos, LanePred);
+                            }
+                            int32 SuccPos = LaneChunk.Find(TEXT("<successor"), ESearchCase::IgnoreCase, ESearchDir::FromStart, LaneLinkPos);
+                            if (SuccPos != INDEX_NONE)
+                            {
+                                ExtractAttribute(LaneChunk, TEXT("id"), SuccPos, LaneSucc);
+                            }
+                        }
+
+                        // width polynomial (take first width)
+                        float WidthSOffset = 0.f;
+                        float A = 0.f, fB = 0.f, C = 0.f, D = 0.f;
+                        int32 WidthPos = LaneChunk.Find(TEXT("<width"), ESearchCase::IgnoreCase, ESearchDir::FromStart, 0);
+                        if (WidthPos != INDEX_NONE)
+                        {
+                            int32 WidthEnd = LaneChunk.Find(TEXT(">"), ESearchCase::IgnoreCase, ESearchDir::FromStart, WidthPos);
+                            if (WidthEnd != INDEX_NONE)
+                            {
+                                FString WidthHeader = LaneChunk.Mid(WidthPos, WidthEnd - WidthPos + 1);
+                                FString tmp;
+                                if (ExtractAttribute(WidthHeader, TEXT("sOffset"), 0, tmp)) WidthSOffset = ParseFloat(tmp);
+                                if (ExtractAttribute(WidthHeader, TEXT("a"), 0, tmp)) A = ParseFloat(tmp);
+                                if (ExtractAttribute(WidthHeader, TEXT("b"), 0, tmp)) fB = ParseFloat(tmp);
+                                if (ExtractAttribute(WidthHeader, TEXT("c"), 0, tmp)) C = ParseFloat(tmp);
+                                if (ExtractAttribute(WidthHeader, TEXT("d"), 0, tmp)) D = ParseFloat(tmp);
+                            }
+                        }
+
+                        // parse all roadMark entries for this lane
+                        TArray<FRoadMarkInfo> AggregatedRoadMarks;
+                        int32 SearchPos = 0;
+                        while (true)
+                        {
+                            int32 RoadMarkPos = LaneChunk.Find(TEXT("<roadMark"), ESearchCase::IgnoreCase, ESearchDir::FromStart, SearchPos);
+                            if (RoadMarkPos == INDEX_NONE)
+                                break;
+                            int32 RMend = LaneChunk.Find(TEXT(">"), ESearchCase::IgnoreCase, ESearchDir::FromStart, RoadMarkPos);
+                            if (RMend == INDEX_NONE)
+                                break;
+                            FString RoadMarkHeader = LaneChunk.Mid(RoadMarkPos, RMend - RoadMarkPos + 1);
+                            FRoadMarkInfo RoadMarkInfo;
+                            ExtractAttribute(RoadMarkHeader, TEXT("type"), 0, RoadMarkInfo.Type);
+                            ExtractAttribute(RoadMarkHeader, TEXT("color"), 0, RoadMarkInfo.Color);
+                            FString widthStr;
+                            if (ExtractAttribute(RoadMarkHeader, TEXT("width"), 0, widthStr))
+                                RoadMarkInfo.Width = ParseFloat(widthStr);
+                            ExtractAttribute(RoadMarkHeader, TEXT("laneChange"), 0, RoadMarkInfo.LaneChange);
+                            FString sOffsetStr;
+                            if (ExtractAttribute(RoadMarkHeader, TEXT("sOffset"), 0, sOffsetStr))
+                                RoadMarkInfo.SOffset = ParseFloat(sOffsetStr);
+                            AggregatedRoadMarks.Add(RoadMarkInfo);
+                            SearchPos = RMend + 1;
+                        }
+
+                        FRawLane RL;
+                        RL.LaneType = LaneType;
+                        RL.LaneId = LaneId;
+                        RL.bIsLeft = bIsLeft;
+                        RL.TravelDir = TravelDir;
+                        RL.WidthSOffset = WidthSOffset;
+                        RL.A = A;
+                        RL.B = fB;
+                        RL.C = C;
+                        RL.D = D;
+                        RL.Predecessor = LanePred.IsEmpty() ? Predecessor : LanePred;
+                        RL.Successor = LaneSucc.IsEmpty() ? Successor : LaneSucc;
+                        RL.RoadMarks = AggregatedRoadMarks;
+                        //The following code is written by Milad Sashurpour PhD student at concordia university - al copy paste rights reserved
+                        OutRawLanes.Add(RL);
+                    }
+                };
+
+                // Gather raw lanes per side
+                TArray<FRawLane> LeftRaw, RightRaw;
+                ParseSideIntoRaw(TEXT("left"), true, LeftRaw);
+                ParseSideIntoRaw(TEXT("right"), false, RightRaw);
+
+                // Sort outward by |id| ascending (OpenDRIVE convention: 1,2,3… on left; -1,-2… on right)
+                auto ParseId = [](const FString& S)->int32
+                {
+                    // robust parse: tolerate non-number ids by returning 0
+                    const TCHAR* Str = *S;
+                    return FCString::Atoi(Str);
+                };
+
+                LeftRaw.Sort([&](const FRawLane& A, const FRawLane& B)
+                    {
+                        int32 ia = FMath::Abs(ParseId(A.LaneId));
+                        int32 ib = FMath::Abs(ParseId(B.LaneId));
+                        if (ia != ib) return ia < ib;
+                        // stable by type/id if needed
+                        return A.LaneId < B.LaneId;
+                    });
+
+                RightRaw.Sort([&](const FRawLane& A, const FRawLane& B)
+                    {
+                        int32 ia = FMath::Abs(ParseId(A.LaneId));
+                        int32 ib = FMath::Abs(ParseId(B.LaneId));
+                        if (ia != ib) return ia < ib;
+                        return A.LaneId < B.LaneId;
+                    });
+
+                // Prepare output lane infos for this section, parallel to raw lanes
+                TArray<FDrivingLaneInfo> LeftInfos, RightInfos;
+
+                auto InitInfos = [&](const TArray<FRawLane>& Raw, TArray<FDrivingLaneInfo>& Infos)
+                {
+                    Infos.Reset();
+                    Infos.Reserve(Raw.Num());
+                    for (const FRawLane& RL : Raw)
+                    {
+                        FDrivingLaneInfo Info;
+                        Info.RoadKey = RoadKey;
+                        Info.LaneType = RL.LaneType;
+                        Info.LaneId = RL.LaneId;
+                        Info.bIsLeft = RL.bIsLeft;
+                        Info.TravelDir = RL.TravelDir;
+                        Info.Predecessor = RL.Predecessor;
+                        Info.Successor = RL.Successor;
+                        Info.RoadMarks = RL.RoadMarks;
+                        Info.SectionStartS = SectionS;
+                        Infos.Add(Info);
+                    }
+                };
+
+                InitInfos(LeftRaw, LeftInfos);
+                InitInfos(RightRaw, RightInfos);
+
+                // NEW: capture widths per-section (then append to global after optional reversal)
+                TMap<FString, TArray<float>> SectionWidths;
+
+                // Sample along the reference line once; fill boundaries using cumulative widths per side
+                if (Samples.Num() > 0)
+                {
+                    for (const FSample& Smp : Samples)
+                    {
+                        if (Smp.s + KINDA_SMALL_NUMBER < SectionS)
+                            continue;
+
+                        float LateralOffset = EvaluateLaneOffsetPieces(LaneOffsetPieces, Smp.s);
+                        FVector2D Perp = FVector2D(-FMath::Sin(Smp.heading), FMath::Cos(Smp.heading));
+                        FVector2D LaneOrigin = Smp.point + Perp * LateralOffset;
+
+                        // LEFT side: outward is +Perp; offset = laneOffset + (cum + width_i)
+                        {
+                            float Cum = 0.f;
+                            for (int32 i = 0; i < LeftRaw.Num(); ++i)
+                            {
+                                const FRawLane& RL = LeftRaw[i];
+                                float DeltaS = Smp.s - (SectionS + RL.WidthSOffset);
+                                if (DeltaS < -KINDA_SMALL_NUMBER)
+                                    continue;
+
+                                float Width = RL.A + RL.B * DeltaS + RL.C * DeltaS * DeltaS + RL.D * DeltaS * DeltaS * DeltaS;
+                                FVector2D BoundaryPt = LaneOrigin + Perp * (Cum + Width);
+                                LeftInfos[i].Points.Add(BoundaryPt);
+
+                                // capture own lane width for this point
+                                const FString Key = MakeLaneKey(RoadKey, RL.LaneType, RL.LaneId, /*bIsLeft=*/true);
+                                SectionWidths.FindOrAdd(Key).Add(FMath::Max(0.f, Width));
+
+                                Cum += Width;
+                            }
+                        }
+
+                        // RIGHT side: outward is -Perp; offset = laneOffset - (cum + width_i)
+                        {
+                            float Cum = 0.f;
+                            for (int32 i = 0; i < RightRaw.Num(); ++i)
+                            {
+                                const FRawLane& RL = RightRaw[i];
+                                float DeltaS = Smp.s - (SectionS + RL.WidthSOffset);
+                                if (DeltaS < -KINDA_SMALL_NUMBER)
+                                    continue;
+
+                                float Width = RL.A + RL.B * DeltaS + RL.C * DeltaS * DeltaS + RL.D * DeltaS * DeltaS * DeltaS;
+                                FVector2D BoundaryPt = LaneOrigin - Perp * (Cum + Width);
+                                RightInfos[i].Points.Add(BoundaryPt);
+
+                                // capture own lane width for this point
+                                const FString Key = MakeLaneKey(RoadKey, RL.LaneType, RL.LaneId, /*bIsLeft=*/false);
+                                SectionWidths.FindOrAdd(Key).Add(FMath::Max(0.f, Width));
+
+                                Cum += Width;
+                            }
+                        }
+                    } // samples loop
+                }
+
+                // Add non-empty lane infos to TempLanes; reverse if travelDir is backward /The following code is written by Milad Sashurpour PhD student at concordia university - al copy paste rights reserved
+                auto FlushInfos = [&](TArray<FDrivingLaneInfo>& Infos)
+                {
+                    for (FDrivingLaneInfo& Info : Infos)
+                    {
+                        if (Info.Points.Num() > 0)
+                        {
+                            const FString Key = MakeLaneKey(Info.RoadKey, Info.LaneType, Info.LaneId, Info.bIsLeft);
+
+                            if (Info.TravelDir == -1)
+                            {
+                                Algo::Reverse(Info.Points);
+                                if (TArray<float>* Arr = SectionWidths.Find(Key))
+                                {
+                                    Algo::Reverse(*Arr);
+                                }
+                            }
+
+                            // Append this section's widths to the global width series
+                            if (const TArray<float>* Arr = SectionWidths.Find(Key))
+                            {
+                                GLaneWidthSamples.FindOrAdd(Key).Append(*Arr);
+                            }
+
+                            TempLanes.Add(Info);
+                            bFoundAny = true;
+                        }
+                    }
+                };
+
+                FlushInfos(LeftInfos);
+                FlushInfos(RightInfos);
+
+            } // end laneSection
+
+            // merge fragments
+            for (FDrivingLaneInfo& Curr : TempLanes)
+            {
+                bool bMerged = false;
+                for (FDrivingLaneInfo& Existing : OutLanes)
+                {
+                    if (Existing.RoadKey == Curr.RoadKey &&
+                        Existing.LaneType == Curr.LaneType &&
+                        Existing.LaneId == Curr.LaneId &&
+                        Existing.bIsLeft == Curr.bIsLeft &&
+                        Existing.TravelDir == Curr.TravelDir &&
+                        Existing.Predecessor == Curr.Predecessor &&
+                        Existing.Successor == Curr.Successor)
+                    {
+                        if (Existing.Points.Num() > 0 && Curr.Points.Num() > 0)
+                        {
+                            const FVector2D& Last = Existing.Points.Last();
+                            const FVector2D& First = Curr.Points[0];
+                            float Dist = FVector2D::Distance(Last, First);
+                            bool bDistanceOk = Dist < 1e-2f;
+
+                            float ExistingHeading = HeadingFromLastSegment(Existing.Points);
+                            float CurrHeading = 0.f;
+                            if (Curr.Points.Num() >= 2)
+                            {
+                                CurrHeading = FMath::Atan2(
+                                    Curr.Points[1].Y - Curr.Points[0].Y,
+                                    Curr.Points[1].X - Curr.Points[0].X
+                                );
+                            }
+                            float AngleDiff = AngularDifference(ExistingHeading, CurrHeading);
+                            bool bHeadingOk = AngleDiff < FMath::DegreesToRadians(10.f);
+
+                            if (bDistanceOk || bHeadingOk)
+                            {
+                                if (Dist >= 1e-3f && Dist < 1e-2f && bHeadingOk && !bDistanceOk)
+                                {
+                                    FVector2D Interp = (Last + First) * 0.5f;
+                                    Existing.Points.Add(Interp);
+                                    // NOTE: If an interpolation point is inserted, there is no exact width sample
+                                    // for it; mesh building will safely fall back to nearest available width./The following code is written by Milad Sashurpour PhD student at concordia university - al copy paste rights reserved
+                                }
+                                Existing.Points.Append(Curr.Points);
+                                bMerged = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!bMerged)
+                {
+                    OutLanes.Add(Curr);
+                }
+            }
+        }
+    }
+
+    return bFoundAny;
+}
+
+bool ASimpleDataExtractionActor::ExtractAttribute(const FString& Source, const FString& AttrName, int32 StartPos, FString& OutValue) const
+{
+    FString Pattern = AttrName + TEXT("=\"");
+    int32 Pos = Source.Find(*Pattern, ESearchCase::IgnoreCase, ESearchDir::FromStart, StartPos);
+    if (Pos == INDEX_NONE)
+        return false;
+    Pos += Pattern.Len();
+    int32 End = Source.Find(TEXT("\""), ESearchCase::IgnoreCase, ESearchDir::FromStart, Pos);
+    if (End == INDEX_NONE)
+        return false;
+    OutValue = Source.Mid(Pos, End - Pos);
+    return true;
+}
+
+float ASimpleDataExtractionActor::ParseFloat(const FString& In) const
+{
+    return FCString::Atof(*In);
+}
+
+int32 ASimpleDataExtractionActor::ParseTravelDir(const FString& LaneChunk) const
+{
+    if (LaneChunk.Contains(TEXT("travelDir=\"forward\""), ESearchCase::IgnoreCase))
+        return +1;
+    if (LaneChunk.Contains(TEXT("travelDir=\"backward\""), ESearchCase::IgnoreCase))
+        return -1;
+    return 0;
+}
+
+void ASimpleDataExtractionActor::BuildReferenceLineSamples(const FString& RoadChunk, TArray<FSample>& OutSamples) const
+{
+    struct FGeom
+    {
+        float s = 0;
+        float x = 0;
+        float y = 0;
+        float hdg = 0;
+        float length = 0;
+        float curvature = 0;
+        bool bIsArc = false;
+    };
+    TArray<FGeom> Geoms;
+
+    // 1) Parse all <geometry> entries into Geoms[]
+    int32 Pos = 0;
+    while (true)
+    {
+        int32 GStart = RoadChunk.Find(TEXT("<geometry"), ESearchCase::IgnoreCase, ESearchDir::FromStart, Pos);
+        if (GStart == INDEX_NONE) break;
+        int32 GEndTag = RoadChunk.Find(TEXT(">"), ESearchCase::IgnoreCase, ESearchDir::FromStart, GStart);
+        if (GEndTag == INDEX_NONE) break;
+
+        FString Header = RoadChunk.Mid(GStart, GEndTag - GStart + 1);
+        FGeom G;
+        FString tmp;
+        if (ExtractAttribute(Header, TEXT("s"), 0, tmp)) G.s = ParseFloat(tmp);
+        if (ExtractAttribute(Header, TEXT("x"), 0, tmp)) G.x = ParseFloat(tmp);
+        if (ExtractAttribute(Header, TEXT("y"), 0, tmp)) G.y = ParseFloat(tmp);
+        if (ExtractAttribute(Header, TEXT("hdg"), 0, tmp)) G.hdg = ParseFloat(tmp);
+        if (ExtractAttribute(Header, TEXT("length"), 0, tmp)) G.length = ParseFloat(tmp);
+
+        // Detect arc vs line
+        int32 GClose = RoadChunk.Find(TEXT("</geometry>"), ESearchCase::IgnoreCase, ESearchDir::FromStart, GEndTag);
+        if (GClose != INDEX_NONE)
+        {
+            int32 ArcPos = RoadChunk.Find(TEXT("<arc"), ESearchCase::IgnoreCase, ESearchDir::FromStart, GEndTag);
+            if (ArcPos != INDEX_NONE && ArcPos < GClose)
+            {
+                int32 ArcEnd = RoadChunk.Find(TEXT(">"), ESearchCase::IgnoreCase, ESearchDir::FromStart, ArcPos);
+                if (ArcEnd != INDEX_NONE)
+                {
+                    FString ArcHeader = RoadChunk.Mid(ArcPos, ArcEnd - ArcPos + 1);
+                    FString curvStr;
+                    if (ExtractAttribute(ArcHeader, TEXT("curvature"), 0, curvStr))
+                    {
+                        G.curvature = ParseFloat(curvStr);
+                        G.bIsArc = true;
+                    }
+                }
+            }
+        }
+
+        Geoms.Add(G);
+        Pos = GEndTag + 1;
+    }
+
+    // 2) Adaptive sampling: 4 points for arcs, 2 for lines
+    for (const FGeom& G : Geoms)
+    {
+        int32 Steps = G.bIsArc ? 3 : 1;  // arcs → 3 subdivisions; lines → just start/end
+
+        for (int32 i = 0; i <= Steps; ++i)
+        {
+            float ds = (i * G.length) / Steps;
+            float sampleS = G.s + ds;
+
+            // Compute raw position & heading
+            float px = G.x;
+            float py = G.y;
+            float heading = G.hdg;
+
+            if (!G.bIsArc)
+            {
+                // straight line interpolation
+                px += ds * FMath::Cos(G.hdg);
+                py += ds * FMath::Sin(G.hdg);
+            }
+            else if (FMath::Abs(G.curvature) > KINDA_SMALL_NUMBER)
+            {
+                // arc interpolation
+                float R = 1.0f / G.curvature;
+                float theta = ds * G.curvature;
+                float cx = G.x - R * FMath::Sin(G.hdg);
+                float cy = G.y + R * FMath::Cos(G.hdg);
+                float newHdg = G.hdg + theta;
+                px = cx + R * FMath::Sin(newHdg);
+                py = cy - R * FMath::Cos(newHdg);
+                heading = newHdg;
+            }
+
+            OutSamples.Add({ sampleS, FVector2D(px, py), heading });
+        }
+    }
+
+    // 3) Sort by station
+    OutSamples.Sort([](const FSample& A, const FSample& B) {
+        return A.s < B.s;
+        });
+}
+
+float ASimpleDataExtractionActor::EvaluateLaneOffset(const FString& LaneOffsetHeader, float QueryS) const
+{
+    // legacy single-piece laneOffset
+    FString sStr, aStr, bStr, cStr, dStr;
+    float s = 0, a = 0, b = 0, c = 0, d = 0;
+    if (ExtractAttribute(LaneOffsetHeader, TEXT("s"), 0, sStr)) s = ParseFloat(sStr);
+    if (ExtractAttribute(LaneOffsetHeader, TEXT("a"), 0, aStr)) a = ParseFloat(aStr);
+    if (ExtractAttribute(LaneOffsetHeader, TEXT("b"), 0, bStr)) b = ParseFloat(bStr);
+    if (ExtractAttribute(LaneOffsetHeader, TEXT("c"), 0, cStr)) c = ParseFloat(cStr);
+    if (ExtractAttribute(LaneOffsetHeader, TEXT("d"), 0, dStr)) d = ParseFloat(dStr);
+    float ds = QueryS - s;
+    return a + b * ds + c * ds * ds + d * ds * ds * ds;
+}
+
+float ASimpleDataExtractionActor::EvaluateWidth(const FString& WidthHeader, float DeltaS) const
+{
+    FString aStr, bStr, cStr, dStr;
+    float a = 0, b = 0, c = 0, d = 0;
+    if (ExtractAttribute(WidthHeader, TEXT("a"), 0, aStr)) a = ParseFloat(aStr);
+    if (ExtractAttribute(WidthHeader, TEXT("b"), 0, bStr)) b = ParseFloat(bStr);
+    if (ExtractAttribute(WidthHeader, TEXT("c"), 0, cStr)) c = ParseFloat(cStr);
+    if (ExtractAttribute(WidthHeader, TEXT("d"), 0, dStr)) d = ParseFloat(dStr);
+    return a + b * DeltaS + c * DeltaS * DeltaS + d * DeltaS * DeltaS * DeltaS;
+}
